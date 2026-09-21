@@ -170,9 +170,24 @@ class ZhihuArticlePlugin(Star):
 
         try:
             cookie_str = self._get_cookie()
+            fast_text_mode = self.config.get("fast_text_when_no_formula", True)
+            max_slice_h = int(self.config.get("max_slice_height", 12000))
 
-            # 1. 抓取知乎数据
+            # 1. 优先使用知乎 API 快速抓取（回答 / 问题通道，无需浏览器）
             content_data = await ZhihuFetcher.fetch(content_type, target_id, cookie_str)
+            article_img_paths: List[str] = []
+
+            # 2. API 不可用时（专栏文章接口需签名会返回 403），回退到 Playwright 浏览器渲染通道
+            #    该通道在同一次导航中完成「正文提取 + 原版极清截图」，速度最优
+            if not content_data:
+                logger.info(f"[ZhihuArticlePlugin] API 抓取失败，切换至浏览器渲染通道: {url}")
+                content_data, article_img_paths = await ZhihuRenderer.extract_and_screenshot_via_browser(
+                    url=url,
+                    cookie_str=cookie_str,
+                    max_slice_height=max_slice_h,
+                    need_screenshot=True,
+                )
+
             if not content_data:
                 yield event.plain_result("❌ 抓取知乎内容失败，请检查链接是否有效或 Cookie 是否需要更新。")
                 return
@@ -203,8 +218,8 @@ class ZhihuArticlePlugin(Star):
                 Node(content=[Plain(first_msg_text)], name=bot_name, uin=bot_uin)
             )
 
+            vote_info = f" · {voteup} 赞同" if voteup and voteup > 0 else ""
             has_media = (formula_count > 0 or image_count > 0)
-            fast_text_mode = self.config.get("fast_text_when_no_formula", True)
 
             if not has_media and fast_text_mode:
                 logger.info(f"[ZhihuArticlePlugin] 内容无插图且无公式，走【纯文本极速合并转发】")
@@ -212,7 +227,7 @@ class ZhihuArticlePlugin(Star):
                 # 节点 2：纯文本总结
                 summary_node_text = (
                     f"📑【AI 深度导读】《{title}》\n"
-                    f"👤 答主/作者：{author} · {voteup} 赞同\n"
+                    f"👤 答主/作者：{author}{vote_info}\n"
                     f"{'-' * 35}\n"
                     f"{md_summary_text}"
                 )
@@ -248,7 +263,7 @@ class ZhihuArticlePlugin(Star):
                 else:
                     summary_node_text = (
                         f"📑【AI 深度导读】《{title}》\n"
-                        f"👤 答主/作者：{author} · {voteup} 赞同\n"
+                        f"👤 答主/作者：{author}{vote_info}\n"
                         f"{'-' * 35}\n"
                         f"{md_summary_text}"
                     )
@@ -257,12 +272,13 @@ class ZhihuArticlePlugin(Star):
                     )
 
                 # 后续节点：知乎原版极清长图（1:1 官方排版，公式零浮动，插图 100% 真实呈现）
-                max_slice_h = int(self.config.get("max_slice_height", 12000))
-                article_img_paths = await ZhihuRenderer.render_direct_zhihu_page(
-                    url=source_url,
-                    cookie_str=cookie_str,
-                    max_slice_height=max_slice_h
-                )
+                # 若走浏览器通道已在同一会话中完成截图，则直接复用，避免二次导航
+                if not article_img_paths:
+                    article_img_paths = await ZhihuRenderer.render_direct_zhihu_page(
+                        url=source_url,
+                        cookie_str=cookie_str,
+                        max_slice_height=max_slice_h
+                    )
                 total_parts = len(article_img_paths)
                 for idx, p in enumerate(article_img_paths, 1):
                     if os.path.exists(p):

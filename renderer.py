@@ -13,6 +13,9 @@ import mistune
 from PIL import Image as PILImage
 from playwright.async_api import async_playwright, Browser, Playwright
 
+# 知乎长图可达上亿像素，解除 Pillow 的像素上限保护
+PILImage.MAX_IMAGE_PIXELS = None
+
 logger = logging.getLogger(__name__)
 
 _BROWSER_LOCK = asyncio.Lock()
@@ -77,22 +80,14 @@ class ZhihuRenderer:
     def _ensure_output_dir(cls):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    @classmethod
-    async def render_direct_zhihu_page(cls, url: str, cookie_str: str = "", max_slice_height: int = 12000) -> List[str]:
-        """
-        直接通过 Playwright 访问知乎原网页进行 1:1 官方原版极清截图。
-        自动注入 Cookie 绕过登录拦截，公式与插图完美原汁原味呈现。
-        """
-        cls._ensure_output_dir()
-        browser = await get_browser()
-
+    @staticmethod
+    async def _build_context(browser: Browser, cookie_str: str = ""):
+        """构建带 Cookie 与反检测的浏览器上下文"""
         context = await browser.new_context(
             viewport={"width": 860, "height": 1200},
-            device_scale_factor=2, # 2x Retina 极清
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            device_scale_factor=2,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
-
-        # 注入知乎 Cookie
         if cookie_str:
             cookies_to_add = []
             for item in cookie_str.split(";"):
@@ -109,82 +104,281 @@ class ZhihuRenderer:
                     await context.add_cookies(cookies_to_add)
                 except Exception as e:
                     logger.warning(f"[ZhihuRenderer] 注入 Cookie 失败: {e}")
+        return context
 
+    @staticmethod
+    async def _clean_page(page) -> None:
+        """净化知乎页面：关闭登录弹窗、移除广告与无关模块（带重试以应对客户端跳转）"""
+        for attempt in range(3):
+            try:
+                await page.evaluate("""() => {
+                    document.querySelectorAll(".Modal-wrapper, .sign_modal, div.Modal").forEach(el => el.remove());
+                    const junkSelectors = [
+                        "header.AppHeader", ".Sticky", ".Question-sideColumn",
+                        ".Reward", ".ContentItem-actions", ".Comments-container",
+                        ".CornerButtons", ".Ad-placeholder", ".OpenInAppButton",
+                        ".MobileAppHeader", ".ViewAll-Question", ".Recommendations-Main",
+                        ".QuestionHeader-footer", ".Post-SideActions", ".ColumnPageHeader"
+                    ];
+                    junkSelectors.forEach(sel => {
+                        document.querySelectorAll(sel).forEach(el => el.remove());
+                    });
+                    document.querySelectorAll("button.ContentItem-more").forEach(btn => btn.click());
+                    if (document.body) {
+                        document.body.style.backgroundColor = "#f6f8fa";
+                    }
+                }""")
+                return
+            except Exception as e:
+                # 页面可能正在客户端跳转（如 zhi.hu 短链重定向），等待后重试
+                if attempt < 2:
+                    await asyncio.sleep(1.5)
+                else:
+                    logger.warning(f"[ZhihuRenderer] 页面净化失败(已重试): {e}")
+
+    @staticmethod
+    async def _wait_settled(page, timeout_ms: int = 8000) -> None:
+        """等待页面网络与 DOM 稳定，避免客户端跳转导致执行上下文被销毁"""
+        try:
+            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _safe_evaluate(page, script: str, default: Any = None, retries: int = 3) -> Any:
+        """
+        健壮地执行页面 JS。
+        知乎为 SPA，客户端路由跳转常在 domcontentloaded 之后发生，
+        会销毁执行上下文（Execution context was destroyed），此处自动等待并重试。
+        """
+        last_err = None
+        for attempt in range(retries):
+            try:
+                return await page.evaluate(script)
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "Execution context was destroyed" in msg or "navigating" in msg:
+                    await asyncio.sleep(1.5)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    continue
+                # 其他错误直接抛出
+                raise
+        logger.warning(f"[ZhihuRenderer] 页面 JS 执行失败(已重试 {retries} 次): {last_err}")
+        return default
+
+    @staticmethod
+    async def _mark_capture_target(page) -> None:
+        """
+        在页面中标记"内容最丰富的正文容器"（打上 data-zh-capture 属性）。
+        采用标记属性而非 JSHandle，可安全地配合重试逻辑，避免上下文销毁导致的句柄失效。
+        """
+        await ZhihuRenderer._safe_evaluate(page, """() => {
+            document.querySelectorAll("[data-zh-capture]").forEach(el => el.removeAttribute("data-zh-capture"));
+            const candidates = document.querySelectorAll(
+                ".RichText, .RichContent-inner, .Post-RichText, .QuestionAnswer-content, .Post-content"
+            );
+            let best = null;
+            let bestLen = 0;
+            candidates.forEach((el) => {
+                const len = el.innerHTML.length;
+                if (len > bestLen) { bestLen = len; best = el; }
+            });
+            (best || document.body).setAttribute("data-zh-capture", "1");
+            return true;
+        }""", default=False)
+
+    @staticmethod
+    async def _get_capture_element(page):
+        """获取被标记的截图目标元素，未标记时回退到 body"""
+        return (await page.query_selector("[data-zh-capture]")) or (await page.query_selector("body"))
+
+    @classmethod
+    async def extract_and_screenshot_via_browser(
+        cls,
+        url: str,
+        cookie_str: str = "",
+        max_slice_height: int = 12000,
+        need_screenshot: bool = True,
+    ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        """
+        通过 Playwright 浏览器渲染提取知乎正文内容，并在同一次导航会话中完成原版极清截图。
+        （这是知乎专栏文章的唯一可靠通道：其 API 无签名会 403）
+
+        返回 (content_html 提取结果, 截图路径列表)。
+        need_screenshot 为 True 时会截图；若提取后发现无插图且无公式，则自动跳过截图以加速。
+        """
+        from .fetcher import ZhihuFetcher  # 延迟导入避免循环依赖
+
+        browser = await get_browser()
+        context = await cls._build_context(browser, cookie_str)
+        page = await context.new_page()
+
+        try:
+            logger.info(f"[ZhihuRenderer] 浏览器渲染提取知乎内容: {url}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await cls._wait_settled(page)
+            await cls._clean_page(page)
+            await page.wait_for_timeout(2500)
+
+            info = await cls._safe_evaluate(page, """() => {
+                const pick = (sels) => {
+                    for (const s of sels) {
+                        const el = document.querySelector(s);
+                        if (el && el.innerText.trim()) return el;
+                    }
+                    return null;
+                };
+                const titleEl = pick([".QuestionHeader-title", ".Post-Title", "h1"]);
+                const authorEl = pick([".AuthorInfo-name", ".Post-Author .AuthorInfo-name", ".AuthorInfo"]);
+
+                // 赞同数：多层次兜底查找（回答页 / 专栏文章页 DOM 结构不同，且为客户端渲染）
+                let voteText = "";
+                const voteCandidates = document.querySelectorAll(
+                    ".VoteButton, .VoteButton--up, button[class*=VoteButton], .Post-Actions .Button"
+                );
+                for (const el of voteCandidates) {
+                    const t = (el.innerText || "").replace(/\\s+/g, " ").trim();
+                    if (t && /赞同|推荐/.test(t)) { voteText = t; break; }
+                }
+                if (!voteText) {
+                    const allEls = document.querySelectorAll("button, .Button, span, div");
+                    for (const el of allEls) {
+                        const t = (el.innerText || "").replace(/\\s+/g, " ").trim();
+                        if (/^赞同\\s*[\\d.]+\\s*万?$/.test(t)) {
+                            voteText = t;
+                            break;
+                        }
+                    }
+                }
+
+                // 选取内容最丰富的正文容器
+                const candidates = document.querySelectorAll(
+                    ".RichText, .RichContent-inner, .Post-RichText, .QuestionAnswer-content, .Post-content"
+                );
+                let best = null;
+                let bestLen = 0;
+                candidates.forEach((el) => {
+                    const len = el.innerHTML.length;
+                    if (len > bestLen) { bestLen = len; best = el; }
+                });
+
+                return {
+                    title: titleEl ? titleEl.innerText.trim() : "",
+                    author: authorEl ? authorEl.innerText.trim() : "知乎用户",
+                    voteText: voteText,
+                    contentHtml: best ? best.innerHTML : "",
+                };
+            }""", default={})
+
+            content_html = (info or {}).get("contentHtml", "")
+            if not content_html:
+                return None, []
+
+            content_data = ZhihuFetcher.build_from_browser_html(
+                content_html=content_html,
+                title=info.get("title", ""),
+                author=info.get("author", ""),
+                vote_text=info.get("voteText", ""),
+                source_url=url,
+            )
+
+            # 无插图无公式且启用极速模式时，跳过截图（页面已经在手，无需二次导航）
+            has_media = (content_data["formula_count"] > 0 or content_data["image_count"] > 0)
+            if not need_screenshot or not has_media:
+                logger.info(
+                    f"[ZhihuRenderer] 跳过截图 (need_screenshot={need_screenshot}, "
+                    f"公式={content_data['formula_count']}, 插图={content_data['image_count']})"
+                )
+                return content_data, []
+
+            # 在同一会话中直接截图
+            await cls._mark_capture_target(page)
+            element = await cls._get_capture_element(page)
+
+            box = await element.bounding_box()
+            target_h = int(box["height"]) if box else 2000
+            await page.set_viewport_size({"width": 860, "height": target_h + 100})
+
+            uid = uuid.uuid4().hex[:8]
+            full_img_path = os.path.join(OUTPUT_DIR, f"zh_direct_{uid}_full.png")
+            await element.screenshot(path=full_img_path, type="png")
+
+            return content_data, cls._slice_image(full_img_path, uid, max_slice_height)
+
+        except Exception as e:
+            logger.error(f"[ZhihuRenderer] 浏览器提取知乎内容失败: {e}", exc_info=True)
+            return None, []
+        finally:
+            await page.close()
+            await context.close()
+
+    @staticmethod
+    def _slice_image(full_img_path: str, uid: str, max_slice_height: int) -> List[str]:
+        """使用 Pillow 对超长图片进行均衡无缝切片（避免出现极小的尾图）"""
+        with PILImage.open(full_img_path) as im:
+            img_w, img_h = im.size
+            if img_h <= max_slice_height:
+                return [full_img_path]
+
+            # 均衡切片：按总高度均分为若干等份，每份不超过阈值
+            part_count = (img_h + max_slice_height - 1) // max_slice_height
+            part_h = (img_h + part_count - 1) // part_count
+
+            logger.info(f"[ZhihuRenderer] 原文截图高 {img_h}px，均衡切分为 {part_count} 段 (每段约 {part_h}px)...")
+            file_paths = []
+            for idx in range(part_count):
+                top = idx * part_h
+                bottom = min(top + part_h, img_h)
+                if top >= bottom:
+                    break
+                part_img = im.crop((0, top, img_w, bottom))
+                part_path = os.path.join(OUTPUT_DIR, f"zh_direct_{uid}_part{idx + 1}.png")
+                part_img.save(part_path, "PNG")
+                file_paths.append(part_path)
+
+            try:
+                os.remove(full_img_path)
+            except Exception:
+                pass
+
+            return file_paths
+
+    @classmethod
+    async def render_direct_zhihu_page(cls, url: str, cookie_str: str = "", max_slice_height: int = 12000) -> List[str]:
+        """
+        直接通过 Playwright 访问知乎原网页进行 1:1 官方原版极清截图。
+        自动注入 Cookie 绕过登录拦截，公式与插图完美原汁原味呈现。
+        """
+        cls._ensure_output_dir()
+        browser = await get_browser()
+        context = await cls._build_context(browser, cookie_str)
         page = await context.new_page()
 
         try:
             logger.info(f"[ZhihuRenderer] 导航知乎原网页截图: {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await cls._wait_settled(page)
+            await cls._clean_page(page)
+            await page.wait_for_timeout(2500)
 
-            # 执行知乎页面净化
-            await page.evaluate("""() => {
-                // 1. 关闭/移除所有可能弹出的登录弹窗
-                document.querySelectorAll(".Modal-wrapper, .sign_modal, div.Modal").forEach(el => el.remove());
+            # 定位正文主体（优先选取内容最丰富的容器）
+            await cls._mark_capture_target(page)
+            element = await cls._get_capture_element(page)
 
-                // 2. 移除知乎顶栏、侧边栏、知乎盐选推荐和评论区
-                const junkSelectors = [
-                    "header.AppHeader", ".Sticky", ".Question-sideColumn",
-                    ".Reward", ".ContentItem-actions", ".Comments-container",
-                    ".CornerButtons", ".Ad-placeholder", ".AuthorInfo-badge",
-                    ".OpenInAppButton", ".MobileAppHeader", ".ViewAll-Question"
-                ];
-                junkSelectors.forEach(sel => {
-                    document.querySelectorAll(sel).forEach(el => el.remove());
-                });
-
-                // 3. 展开被折叠的内容
-                document.querySelectorAll("button.ContentItem-more").forEach(btn => btn.click());
-
-                // 4. 背景美化
-                if (document.body) {
-                    document.body.style.backgroundColor = "#f6f8fa";
-                }
-            }""")
-
-            await page.wait_for_timeout(2000)
-
-            # 定位主体卡片
-            target_el = (
-                await page.query_selector(".QuestionAnswer-content")
-                or await page.query_selector(".Post-RichTextContainer")
-                or await page.query_selector(".AnswerCard")
-                or await page.query_selector(".Post-content")
-                or await page.query_selector(".Question-main")
-                or await page.query_selector("body")
-            )
-
-            box = await target_el.bounding_box()
+            box = await element.bounding_box()
             target_h = int(box["height"]) if box else 2000
 
             await page.set_viewport_size({"width": 860, "height": target_h + 100})
 
             uid = uuid.uuid4().hex[:8]
             full_img_path = os.path.join(OUTPUT_DIR, f"zh_direct_{uid}_full.png")
-            await target_el.screenshot(path=full_img_path, type="png")
+            await element.screenshot(path=full_img_path, type="png")
 
-            # Pillow 切片处理
-            with PILImage.open(full_img_path) as im:
-                img_w, img_h = im.size
-                if img_h <= max_slice_height:
-                    return [full_img_path]
-
-                logger.info(f"[ZhihuRenderer] 原文截图高达 {img_h}px (阈值 {max_slice_height}px)，进行智能分段切片...")
-                file_paths = []
-                part_idx = 1
-                for y in range(0, img_h, max_slice_height):
-                    bottom = min(y + max_slice_height, img_h)
-                    part_img = im.crop((0, y, img_w, bottom))
-                    part_path = os.path.join(OUTPUT_DIR, f"zh_direct_{uid}_part{part_idx}.png")
-                    part_img.save(part_path, "PNG")
-                    file_paths.append(part_path)
-                    part_idx += 1
-
-                try:
-                    os.remove(full_img_path)
-                except Exception:
-                    pass
-
-                return file_paths
+            return cls._slice_image(full_img_path, uid, max_slice_height)
 
         finally:
             await page.close()
@@ -216,7 +410,9 @@ class ZhihuRenderer:
         # 3. 恢复公式并标准化
         html_body = _restore_math_tokens(html_body, pieces)
 
-        badge_info = f'<span class="badge">包含 {formula_count} 个数学公式</span>' if formula_count > 0 else f'<span class="badge">知乎赞同 {voteup}</span>'
+        badge_info = f'<span class="badge">包含 {formula_count} 个数学公式</span>' if formula_count > 0 else '<span class="badge">深度精读</span>'
+        # 赞同数可能因页面异步渲染而缺失，仅在获取到时展示，避免显示误导性的 0
+        vote_info = f" · {voteup} 赞同" if voteup and voteup > 0 else "" 
 
         if os.path.exists(LOCAL_MATHJAX_PATH):
             mathjax_script_tag = f'<script type="text/javascript" src="file://{LOCAL_MATHJAX_PATH}?config=TeX-MML-AM_CHTML"></script>'
@@ -332,7 +528,7 @@ class ZhihuRenderer:
     </div>
     <div class="article-meta">
       <h1 class="article-title">{title}</h1>
-      <div class="article-author">答主/作者：{author} · {voteup} 赞同</div>
+      <div class="article-author">答主/作者：{author}{vote_info}</div>
     </div>
     <div class="md-body">
       {html_body}
