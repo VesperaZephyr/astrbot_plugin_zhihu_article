@@ -3,7 +3,7 @@
 <div align="center">
 
 ![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-blue.svg)
-![Version](https://img.shields.io/badge/Version-1.1.0-green.svg)
+![Version](https://img.shields.io/badge/Version-1.1.1-green.svg)
 ![License](https://img.shields.io/badge/License-MIT-orange.svg)
 ![Author](https://img.shields.io/badge/Author-VesperaZephyr-purple.svg)
 
@@ -127,6 +127,22 @@ python -m playwright install-deps chromium
 ---
 
 ## 📝 更新日志
+
+### v1.1.1
+
+**修复**
+
+1. **长图里公式整片空白（根因修复）** —— v1.1.0 新增的资源就绪判定，误把 `MathJax_Preview` 当作「公式已排版完成」的标志。
+   但 `MathJax_Preview` 恰恰是 MathJax 在排版**之前**插入的占位元素，排版完成后仍会残留在 DOM 中（通常为空）。
+   其后果是：只要 MathJax 刚开始处理、插入了占位符，等待循环就会在约 1.2 秒后（DOM 长度连续两次不变）判定「资源就绪」并提前放行，
+   而此时异步排版尚未产出真正的排版产物 —— 于是长图截到了尚未渲染的公式。
+   现改为要求**真实排版产物存在且具备实际尺寸**（`.MathJax_SVG` / `.MathJax_CHTML` / `mjx-container` / `.katex` 等，且 bounding box 宽高 > 1px）才算完成。
+   实测验证：人为移除某个公式的排版产物、只保留 `MathJax_Preview` 时，旧判定报告 `pending=0`（误判完成），新判定正确报告 `pending=1`。
+2. **等待作用域过大，在问题页易超时** —— `_wait_assets_ready` 原先在「定位正文容器」之前执行，此时页面还没有任何目标标记，
+   就绪统计的 root 会退化成 `document.body`。在问题页上这意味着要等待**数十条回答**的全部图片与公式渲染完成，
+   极易超时后带着未渲染的公式去截图。现改为先对正文容器做一次「预定位」，使等待只作用于目标正文。
+
+---
 
 ### v1.1.0
 

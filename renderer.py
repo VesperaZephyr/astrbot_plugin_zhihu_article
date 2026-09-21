@@ -2,7 +2,11 @@
 """
 Playwright 知乎原版极清截图与 MathJax 总结卡片渲染引擎
 
-v1.1.0 关键优化：
+v1.1.1 关键修复：
+  公式就绪判定不再把 MathJax_Preview 当作「已排版」标志（它是排版前的占位元素），
+  改为要求真实排版产物存在且具备实际尺寸，杜绝「公式未渲染就截图」。
+
+核心能力：
 1. 【内容就绪检测】渐进滚动唤醒懒加载 -> 强制注入真实图片地址 -> 轮询等待全部图片
    解码完成 & 全部公式（MathJax / KaTeX）排版完成 -> 等待 DOM 稳定。
    彻底根治「公式还没渲染完就截图」「长图下半部分图片空白」。
@@ -213,10 +217,20 @@ _JS_ASSET_STAT = r"""() => {
         // 图片型公式（zhihu equation 服务出图）由上面的图片等待逻辑负责
         if (m.tagName === "IMG") return;
         mathTotal++;
-        const rendered = m.querySelector(
-            ".MathJax, .MathJax_CHTML, .MathJax_SVG, .MathJax_Preview, .katex, svg"
-        );
-        if (!rendered && m.children.length === 0) pendingMath++;
+        // 关键：绝不能把 .MathJax_Preview 当作「已排版」标志。
+        // 它是 MathJax 排版【之前】插入的占位元素，排版完成后仍会残留在 DOM 中（通常为空），
+        // 一旦把它算作渲染完成，等待循环就会在公式尚未真正排版时提前放行，最终截到空白公式。
+        // 这里改为要求「真实排版产物存在且具备实际尺寸」才算完成。
+        const prod = m.querySelector(
+            ".MathJax_SVG, .MathJax_SVG_Display, .MathJax_CHTML, .MathJax_MathML, "
+            + "mjx-container, .katex"
+        ) || m.querySelector("svg");
+        let done = false;
+        if (prod) {
+            const r = prod.getBoundingClientRect();
+            done = r.width > 1 && r.height > 1;
+        }
+        if (!done) pendingMath++;
     });
 
     let mjPending = 0;
@@ -751,15 +765,23 @@ class ZhihuRenderer:
         在页面上构建隔离的干净舞台并截图。
         先充分等待资源就绪，再裁剪，确保公式与插图均已完整渲染。
         """
-        # 1) 滚动唤醒 + 等待图片解码与公式排版完成
+        # 1) 先行「预定位」正文容器（此处失败不中止流程）：
+        #    让紧随其后的资源就绪等待把作用域收敛到目标容器。否则 root 会退化成
+        #    document.body —— 在问题页上等于要等数十条回答的全部图片与公式，
+        #    极易在超时后带着尚未渲染的公式去截图。
+        pre_mark = await cls._safe_evaluate(page, _JS_MARK_TARGET, arg=_CAPTURE_SELECTORS,
+                                            default={"ok": False})
+        logger.info(f"[ZhihuRenderer] 正文容器预定位: {pre_mark}")
+
+        # 2) 滚动唤醒 + 等待图片解码与公式排版完成
         await cls._wait_assets_ready(page, timeout_s=wait_timeout, do_scroll=True)
 
-        # 1.5) 错误页可能在滚动/懒加载过程中才出现，此处再确认一次
+        # 2.5) 错误页可能在滚动/懒加载过程中才出现，此处再确认一次
         if url and not await cls._ensure_not_error_page(page, url):
             logger.error("[ZhihuRenderer] 页面确认为知乎错误页且兜底失败，放弃截图")
             return []
 
-        # 2) 精确定位正文容器
+        # 3) 精确定位正文容器（滚动后 DOM 可能已变化，重新确认一次）
         mark = await cls._safe_evaluate(page, _JS_MARK_TARGET, arg=_CAPTURE_SELECTORS,
                                         default={"ok": False})
         logger.info(f"[ZhihuRenderer] 正文容器命中: {mark}")

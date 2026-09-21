@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
     name="astrbot_plugin_zhihu_article",
     author="VesperaZephyr",
     desc="自动读取知乎回答与专栏文章全部内容，保留数学公式，合并转发知乎原版高清长图与 Markdown 深度总结导读",
-    version="1.1.0",
+    version="1.1.1",
     repo="https://github.com/VesperaZephyr/astrbot_plugin_zhihu_article"
 )
 class ZhihuArticlePlugin(Star):
@@ -40,7 +40,7 @@ class ZhihuArticlePlugin(Star):
         super().__init__(context)
         self.config = config
         self._handling_ids = set()
-        logger.info("[ZhihuArticlePlugin] 知乎回答与专栏文章全文精读与公式总结插件 v1.1.0 已加载。")
+        logger.info("[ZhihuArticlePlugin] 知乎回答与专栏文章全文精读与公式总结插件 v1.1.1 已加载。")
 
     def _get_cookie(self) -> str:
         """获取知乎 Cookie（若未配置，尝试从其他知乎插件自动继承）"""
