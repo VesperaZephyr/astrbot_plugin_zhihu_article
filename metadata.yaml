@@ -1,0 +1,8 @@
+name: astrbot_plugin_zhihu_article
+desc: 自动读取知乎回答与专栏文章全部内容，保留数学公式，合并转发知乎原版高清长图与 Markdown 深度总结导读
+version: "1.0.0"
+author: VesperaZephyr
+repo: https://github.com/VesperaZephyr/astrbot_plugin_zhihu_article
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.0.0"

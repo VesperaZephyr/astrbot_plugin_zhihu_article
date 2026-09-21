@@ -1,0 +1,55 @@
+{
+  "zhihu_cookie": {
+    "description": "知乎 Cookie",
+    "type": "string",
+    "default": "",
+    "hint": "知乎账号的 Cookie 凭证（包含 z_c0 等）。若已在其他知乎插件中配置过，本插件会自动优先继承复用"
+  },
+  "enable_auto_detect": {
+    "description": "启用知乎链接自动识别",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，群聊或私聊中发送知乎回答、文章或问题链接将自动触发读取、长图与深度总结"
+  },
+  "fast_text_when_no_formula": {
+    "description": "无图无公式文章启用快速纯文本合并转发",
+    "type": "bool",
+    "default": true,
+    "hint": "若文章/回答纯为文本（无插图无公式），跳过长图截图，直接合并转发纯文本总结与原文段落，秒级极速响应"
+  },
+  "summary_style": {
+    "description": "AI 总结风格",
+    "type": "string",
+    "default": "academic_math",
+    "options": [
+      "academic_math",
+      "concise",
+      "detailed"
+    ],
+    "hint": "academic_math(学术数理精读: 提炼核心论点与公式推导) / concise(极简速读) / detailed(详尽全面)"
+  },
+  "max_slice_height": {
+    "description": "单张长图最大高度(像素)",
+    "type": "int",
+    "default": 12000,
+    "min": 4000,
+    "max": 25000,
+    "hint": "若知乎回答或文章极长超过此高度，将自动进行智能分段切片截图，防止 QQ 移动端严重压缩模糊"
+  },
+  "access_mode": {
+    "description": "群聊访问控制模式",
+    "type": "string",
+    "default": "blacklist",
+    "options": [
+      "blacklist",
+      "whitelist"
+    ],
+    "hint": "blacklist(黑名单模式，名单内的群不触发) / whitelist(白名单模式，仅名单内的群触发)"
+  },
+  "group_list": {
+    "description": "群号列表(逗号分隔)",
+    "type": "string",
+    "default": "",
+    "hint": "黑名单或白名单的群号列表，用英文逗号分隔，如：123456,789012"
+  }
+}
