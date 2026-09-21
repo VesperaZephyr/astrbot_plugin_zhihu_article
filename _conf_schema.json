@@ -36,6 +36,30 @@
     "max": 25000,
     "hint": "若知乎回答或文章极长超过此高度，将自动进行智能分段切片截图，防止 QQ 移动端严重压缩模糊"
   },
+  "content_wait_timeout": {
+    "description": "正文资源等待上限(秒)",
+    "type": "int",
+    "default": 25,
+    "min": 5,
+    "max": 90,
+    "hint": "等待知乎正文中的图片解码与数学公式(MathJax/KaTeX)排版完成的最长时间。长文或公式极多时可调大；超时后会按当前状态继续截图并在日志中告警"
+  },
+  "content_width": {
+    "description": "长图正文宽度(像素)",
+    "type": "int",
+    "default": 760,
+    "min": 600,
+    "max": 1000,
+    "hint": "截图舞台的宽度。插件只截取被克隆进干净舞台的正文区域，不含顶栏、侧栏、广告与评论区，此值即最终长图的视觉宽度"
+  },
+  "content_padding": {
+    "description": "长图正文留白(像素)",
+    "type": "int",
+    "default": 26,
+    "min": 0,
+    "max": 60,
+    "hint": "干净舞台四周的白色内边距。数值越小，长图边角留白越少、正文占比越高"
+  },
   "access_mode": {
     "description": "群聊访问控制模式",
     "type": "string",

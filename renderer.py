@@ -1,10 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 Playwright 知乎原版极清截图与 MathJax 总结卡片渲染引擎
+
+v1.1.0 关键优化：
+1. 【内容就绪检测】渐进滚动唤醒懒加载 -> 强制注入真实图片地址 -> 轮询等待全部图片
+   解码完成 & 全部公式（MathJax / KaTeX）排版完成 -> 等待 DOM 稳定。
+   彻底根治「公式还没渲染完就截图」「长图下半部分图片空白」。
+2. 【纯净舞台裁剪】按优先级精确锁定正文容器，克隆进隔离的干净舞台中渲染，
+   屏蔽顶栏 / 侧栏 / 广告 / 评论区 / 页脚等一切非正文内容，并压缩无意义留白。
+   彻底根治「截图边角太多、非正文区域过多」。
 """
 
 import os
 import re
+import time
 import asyncio
 import logging
 import uuid
@@ -25,6 +34,9 @@ _GLOBAL_BROWSER: Optional[Browser] = None
 OUTPUT_DIR = "/AstrBot/data/temp/zhihu_article"
 LOCAL_MATHJAX_PATH = "/AstrBot/data/plugins/astrbot_plugin_mathsolve/vendor/md2img/mathjax-2.7.7/MathJax.js"
 
+# Chromium 单张截图的最大边限制，超出会产出空白图
+_MAX_CAPTURE_PX = 16000
+
 # 全覆盖数学公式正则：支持 $$, $, \[, \(
 _MATH_TOKEN_RE = re.compile(
     r"(?<!\\)\$\$[\s\S]*?(?<!\\)\$\$|"
@@ -33,6 +45,24 @@ _MATH_TOKEN_RE = re.compile(
     r"(?<!\\)\$[^\n]*?(?<!\\)\$"
 )
 
+# 正文容器候选：按优先级命中即止（不再使用「最长 innerHTML」的粗暴启发式，
+# 该启发式会误选 .Post-content / .RichContent-inner 等带作者卡与操作栏的外层容器）
+_CAPTURE_SELECTORS = [
+    ".Post-RichText",                      # 专栏文章正文
+    ".QuestionAnswer-content .RichText",   # 回答正文（单回答视图）
+    ".AnswerCard .RichText",               # 回答正文（卡片视图）
+    ".RichContent-inner .RichText",        # 回答正文（通用）
+    ".Post-content .RichText",             # 专栏正文（旧版）
+    ".RichText.ztext",                     # 知乎通用富文本容器
+    ".RichText",
+    ".QuestionAnswer-content",
+    ".RichContent-inner",
+    ".Post-content",
+    "article",
+    "main",
+]
+
+
 def _protect_math_for_markdown(text: str) -> Tuple[str, List[str]]:
     pieces = []
     def repl(m):
@@ -40,6 +70,7 @@ def _protect_math_for_markdown(text: str) -> Tuple[str, List[str]]:
         return f"<!--MATH_TOKEN_{len(pieces)-1}-->"
     text = _MATH_TOKEN_RE.sub(repl, text)
     return text, pieces
+
 
 def _restore_math_tokens(html: str, pieces: List[str]) -> str:
     for i, piece in enumerate(pieces):
@@ -50,6 +81,7 @@ def _restore_math_tokens(html: str, pieces: List[str]) -> str:
             normalized = "$" + normalized[2:-2] + "$"
         html = html.replace(f"<!--MATH_TOKEN_{i}-->", normalized)
     return html
+
 
 async def get_browser() -> Browser:
     global _GLOBAL_PLAYWRIGHT, _GLOBAL_BROWSER
@@ -68,9 +100,368 @@ async def get_browser() -> Browser:
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
+                "--allow-file-access-from-files",  # 允许 file:// 页面加载本地 MathJax
             ]
         )
         return _GLOBAL_BROWSER
+
+
+# ---------------------------------------------------------------------------
+# 页面侧 JS 脚本
+# ---------------------------------------------------------------------------
+
+# 展开被折叠的长回答 / 长文，并解除折叠高度限制
+_JS_EXPAND_CONTENT = r"""() => {
+    const btnSelectors = [
+        "button.ContentItem-more", ".ContentItem-rightButton",
+        ".RichText-expand button", ".RichContent-expand button",
+        ".Post-RichText .expandBtn", ".ContentItem-arrow",
+        "button[class*=expand]", ".ExpandButton", ".ContentItem-expandButton"
+    ];
+    let clicked = 0;
+    btnSelectors.forEach(sel => {
+        document.querySelectorAll(sel).forEach(b => {
+            try { b.click(); clicked++; } catch (e) {}
+        });
+    });
+    // 解除折叠产生的高度截断与渐变遮罩
+    const blocks = document.querySelectorAll(
+        ".RichContent-inner, .RichText, .Post-RichText, .QuestionAnswer-content, .Post-content"
+    );
+    blocks.forEach(el => {
+        el.style.maxHeight = "none";
+        el.style.height = "auto";
+        el.style.overflow = "visible";
+        el.style.webkitMaskImage = "none";
+        el.style.maskImage = "none";
+    });
+    document.querySelectorAll(
+        ".ContentItem-collapseMask, .CollapseMask, .RichContent-collapsed"
+    ).forEach(el => el.remove());
+    return clicked;
+}"""
+
+# 强制唤醒懒加载图片：把 data-* 中的真实地址写回 src，并关闭 lazy 策略
+_JS_WAKE_IMAGES = r"""() => {
+    const realAttrs = [
+        "data-original", "data-actualsrc", "data-src",
+        "data-lazy-src", "data-original-src", "data-thumbnail"
+    ];
+    let woken = 0;
+    document.querySelectorAll("img").forEach(im => {
+        const cur = im.getAttribute("src") || "";
+        if (!cur || cur.indexOf("data:") === 0) {
+            for (const a of realAttrs) {
+                const v = im.getAttribute(a);
+                if (v && v.indexOf("data:") !== 0) {
+                    im.setAttribute("src", v);
+                    woken++;
+                    break;
+                }
+            }
+        }
+        im.removeAttribute("loading");
+        im.setAttribute("decoding", "sync");
+    });
+    return woken;
+}"""
+
+# 渐进式滚动整页，触发懒加载与 MathJax 的分批排版，最后回到顶部
+_JS_SCROLL_THROUGH = r"""async () => {
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const step = Math.max(400, Math.floor(window.innerHeight * 0.8));
+    let prevH = -1;
+    for (let i = 0; i < 100; i++) {
+        const h = Math.max(
+            document.body ? document.body.scrollHeight : 0,
+            document.documentElement ? document.documentElement.scrollHeight : 0
+        );
+        const y = i * step;
+        if (y > h + 200) break;
+        window.scrollTo(0, y);
+        await sleep(110);
+        prevH = h;
+    }
+    const finalH = Math.max(
+        document.body ? document.body.scrollHeight : 0,
+        document.documentElement ? document.documentElement.scrollHeight : 0
+    );
+    window.scrollTo(0, finalH);
+    await sleep(400);
+    window.scrollTo(0, 0);
+    await sleep(150);
+    return finalH;
+}"""
+
+# 统计待完成资源：未解码图片 / 未排版公式 / MathJax 队列积压 / DOM 长度指纹
+_JS_ASSET_STAT = r"""() => {
+    const root = document.getElementById("zh-capture-stage")
+        || document.querySelector("[data-zh-capture]")
+        || document.body;
+    if (!root) return null;
+
+    let imgTotal = 0, pendingImg = 0;
+    root.querySelectorAll("img").forEach(im => {
+        const src = im.getAttribute("src") || "";
+        if (!src || src.indexOf("data:") === 0) return;
+        imgTotal++;
+        if (!(im.complete && im.naturalWidth > 0)) pendingImg++;
+    });
+
+    let mathTotal = 0, pendingMath = 0;
+    root.querySelectorAll(".ztext-math, [data-tex]").forEach(m => {
+        // 图片型公式（zhihu equation 服务出图）由上面的图片等待逻辑负责
+        if (m.tagName === "IMG") return;
+        mathTotal++;
+        const rendered = m.querySelector(
+            ".MathJax, .MathJax_CHTML, .MathJax_SVG, .MathJax_Preview, .katex, svg"
+        );
+        if (!rendered && m.children.length === 0) pendingMath++;
+    });
+
+    let mjPending = 0;
+    try {
+        const q = window.MathJax && window.MathJax.Hub && window.MathJax.Hub.queue;
+        if (q && q.pending > 0) mjPending = q.pending;
+    } catch (e) {}
+
+    return {
+        imgTotal: imgTotal,
+        pendingImg: pendingImg,
+        mathTotal: mathTotal,
+        pendingMath: pendingMath,
+        mjPending: mjPending,
+        htmlLen: (root.innerHTML || "").length,
+    };
+}"""
+
+_JS_DOM_FINGERPRINT = r"""() => {
+    const root = document.getElementById("zh-capture-stage")
+        || document.querySelector("[data-zh-capture]")
+        || document.body;
+    return root ? (root.innerHTML || "").length : -1;
+}"""
+
+_JS_FONTS_READY = r"""() => {
+    if (document.fonts && document.fonts.ready) {
+        return document.fonts.ready.then(() => true);
+    }
+    return Promise.resolve(true);
+}"""
+
+# 检测知乎错误页（回答直达页常被知乎对无头浏览器返回「出了一点问题」）
+_JS_IS_ERROR_PAGE = r"""() => {
+    const t = (document.body ? document.body.innerText : "") || "";
+    const markers = [
+        "出了一点问题", "我们正在解决", "去往首页", "页面不存在",
+        "该内容已被删除", "内容已删除", "你访问的页面出错了", "页面走丢了"
+    ];
+    let hit = "";
+    for (const m of markers) { if (t.indexOf(m) >= 0) { hit = m; break; } }
+    const errEl = document.querySelector(".ErrorPage, .ZhihuErrorPage, .error-page");
+    return { isError: !!hit || !!errEl, marker: hit, bodyLen: t.trim().length };
+}"""
+
+# 在问题页中定位指定回答，并锁定为截图目标
+_JS_FOCUS_ANSWER = r"""(aid) => {
+    const anchors = document.querySelectorAll('a[href*="/answer/' + aid + '"]');
+    let card = null;
+    for (const a of anchors) {
+        const c = a.closest(".ContentItem") || a.closest(".AnswerItem")
+            || a.closest(".Card") || a.closest(".List-item") || a.parentElement;
+        if (c && (c.innerText || "").trim().length > 80) { card = c; break; }
+    }
+    if (!card) return { ok: false, reason: "answer-not-found" };
+
+    const body = card.querySelector(".RichText, .RichContent-inner, .Post-RichText");
+    const target = body || card;
+    document.querySelectorAll("[data-zh-capture], [data-zh-capture-locked]").forEach(el => {
+        el.removeAttribute("data-zh-capture");
+        el.removeAttribute("data-zh-capture-locked");
+    });
+    target.setAttribute("data-zh-capture", "1");
+    target.setAttribute("data-zh-capture-locked", "1");
+    return { ok: true, textLen: (target.innerText || "").trim().length };
+}"""
+
+# 按优先级标记正文容器（打 data-zh-capture 属性，避免 JSHandle 在 SPA 跳转后失效）
+_JS_MARK_TARGET = r"""(selectors) => {
+    // 已被回答页兜底逻辑锁定的目标优先保留
+    const locked = document.querySelector("[data-zh-capture-locked]");
+    if (locked) {
+        locked.setAttribute("data-zh-capture", "1");
+        return { ok: true, selector: "locked-answer", textLen: (locked.innerText || "").trim().length };
+    }
+    document.querySelectorAll("[data-zh-capture]").forEach(el => el.removeAttribute("data-zh-capture"));
+    const MIN_LEN = 120;
+    let best = null, bestSel = "";
+    for (const s of selectors) {
+        const el = document.querySelector(s);
+        if (el && (el.innerText || "").trim().length >= MIN_LEN) {
+            best = el;
+            bestSel = s;
+            break;
+        }
+    }
+    if (!best) {
+        // 兜底：退化为"内容最长的富文本容器"，再不行才用 body
+        let maxLen = 0;
+        document.querySelectorAll(".RichText, .Post-RichText, .RichContent-inner").forEach(el => {
+            const len = (el.innerText || "").trim().length;
+            if (len > maxLen) { maxLen = len; best = el; bestSel = "fallback-longest"; }
+        });
+        if (!best && document.body) { best = document.body; bestSel = "body"; }
+    }
+    if (!best) return { ok: false, selector: "", textLen: 0 };
+    best.setAttribute("data-zh-capture", "1");
+    return { ok: true, selector: bestSel, textLen: (best.innerText || "").trim().length };
+}"""
+
+# 把正文克隆进一个隔离、紧凑、白底的"舞台"容器，隐藏页面其余全部元素
+_JS_BUILD_STAGE = r"""(cfg) => {
+    const src = document.querySelector("[data-zh-capture]");
+    if (!src) return { ok: false, reason: "no-capture-target" };
+    document.querySelectorAll("#zh-capture-stage").forEach(el => el.remove());
+
+    const clone = src.cloneNode(true);
+
+    // 1) 剔除克隆体内残留的非正文模块
+    const innerJunk = [
+        ".AuthorInfo", ".AuthorInfo-content", ".ContentItem-actions", ".ContentItem-time",
+        ".ContentItem-meta", ".Post-SideActions", ".Post-Header", ".Post-Footer",
+        ".RichContent-actions", ".Reward", ".Reward-container", ".Comments-container",
+        ".CommentsV2", ".CommentBox", ".CornerButtons", ".VoteButton", ".OpenInAppButton",
+        ".Ad-placeholder", ".AdblockBanner", ".ColumnPageHeader", ".ArticleItem-label",
+        ".KfeCollection", ".MCNLinkCard", ".MembershipCard", ".PcWordCard",
+        ".RichText-expand", ".ContentItem-more", ".ContentItem-rightButton",
+        ".Banner", ".Topstory", ".GlobalSideBar", ".BackToTop", ".Footer", ".AppFooter",
+        "button", "script", "style", "noscript", "iframe", "video", "audio"
+    ];
+    innerJunk.forEach(sel => {
+        try { clone.querySelectorAll(sel).forEach(el => el.remove()); } catch (e) {}
+    });
+
+    // 2) 克隆体内的图片同样强制真实地址，并避免超宽撑破舞台
+    const realAttrs = [
+        "data-original", "data-actualsrc", "data-src",
+        "data-lazy-src", "data-original-src", "data-thumbnail"
+    ];
+    clone.querySelectorAll("img").forEach(im => {
+        const cur = im.getAttribute("src") || "";
+        if (!cur || cur.indexOf("data:") === 0) {
+            for (const a of realAttrs) {
+                const v = im.getAttribute(a);
+                if (v && v.indexOf("data:") !== 0) { im.setAttribute("src", v); break; }
+            }
+        }
+        im.removeAttribute("loading");
+        im.setAttribute("decoding", "sync");
+        im.style.maxWidth = "100%";
+        im.style.height = "auto";
+        // 行内公式图片必须保持 inline，否则公式会掉行
+        if (!im.classList.contains("ztext-math")) {
+            im.style.display = "block";
+            im.style.margin = "12px auto";
+        }
+    });
+
+    // 3) 解除内部元素的截断与横向溢出
+    //    注意：跳过 MathJax / KaTeX 产物，强行改其 max-width 会挤压长公式导致换行错乱
+    clone.querySelectorAll("*").forEach(el => {
+        const cls = (el.className && el.className.toString) ? el.className.toString() : "";
+        if (cls.indexOf("MathJax") >= 0 || cls.indexOf("katex") >= 0 || cls.indexOf("mjx") >= 0) return;
+        el.style.maxWidth = "100%";
+        el.style.maxHeight = "none";
+        el.style.overflow = "visible";
+    });
+
+    // 4) 隐藏滚动条，避免占位宽度导致舞台被挤出可视区
+    let st = document.getElementById("zh-capture-style");
+    if (!st) {
+        st = document.createElement("style");
+        st.id = "zh-capture-style";
+        (document.head || document.documentElement).appendChild(st);
+    }
+    st.textContent = "::-webkit-scrollbar{width:0;height:0;display:none;}"
+        + " html,body{scrollbar-width:none;}";
+
+    const W = cfg.width;
+    const PAD = cfg.padding;
+
+    const stage = document.createElement("div");
+    stage.id = "zh-capture-stage";
+    stage.style.cssText = [
+        "display:block", "box-sizing:border-box", "width:100%",
+        "margin:0", "padding:" + PAD + "px",
+        "background:#ffffff", "color:#1a1a1a",
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC',"
+            + "'Hiragino Sans GB','Microsoft YaHei','WenQuanYi Zen Hei',sans-serif",
+        "text-align:left", "position:relative", "z-index:2147483647", "overflow:visible"
+    ].join(";");
+
+    const inner = document.createElement("div");
+    inner.id = "zh-capture-inner";
+    inner.style.cssText = "display:block;box-sizing:border-box;width:100%;max-width:100%;"
+        + "overflow:visible;background:#ffffff;";
+    inner.appendChild(clone);
+    stage.appendChild(inner);
+
+    clone.style.margin = "0";
+    clone.style.padding = "0";
+    clone.style.width = "100%";
+    clone.style.maxWidth = "100%";
+    clone.style.background = "transparent";
+
+    // 5) 隐藏原页面的一切内容，只留下舞台
+    document.querySelectorAll("body > *").forEach(el => {
+        if (el.id === "zh-capture-stage") return;
+        el.style.setProperty("display", "none", "important");
+    });
+    document.documentElement.style.cssText =
+        "margin:0;padding:0;min-width:0;background:#ffffff;";
+    document.body.style.cssText = "margin:0;padding:0;min-width:0;max-width:" + W
+        + "px;width:" + W + "px;background:#ffffff;overflow:visible;";
+
+    document.body.appendChild(stage);
+    return { ok: true, width: W, padding: PAD };
+}"""
+
+_JS_EXTRACT_INFO = r"""() => {
+    const pick = (sels) => {
+        for (const s of sels) {
+            const el = document.querySelector(s);
+            if (el && el.innerText && el.innerText.trim()) return el;
+        }
+        return null;
+    };
+    const titleEl = pick([".QuestionHeader-title", ".Post-Title", ".ArticleItem-title", "h1"]);
+    const authorEl = pick([".AuthorInfo-name", ".Post-Author .AuthorInfo-name", ".AuthorInfo", ".Post-Author"]);
+
+    // 赞同数：多层次兜底查找（回答页 / 专栏文章页 DOM 结构不同，且为客户端渲染）
+    let voteText = "";
+    const voteCandidates = document.querySelectorAll(
+        ".VoteButton, .VoteButton--up, button[class*=VoteButton], .Post-Actions .Button"
+    );
+    for (const el of voteCandidates) {
+        const t = (el.innerText || "").replace(/\s+/g, " ").trim();
+        if (t && /赞同|推荐/.test(t)) { voteText = t; break; }
+    }
+    if (!voteText) {
+        const allEls = document.querySelectorAll("button, .Button, span, div");
+        for (const el of allEls) {
+            const t = (el.innerText || "").replace(/\s+/g, " ").trim();
+            if (/^赞同\s*[\d.]+\s*万?$/.test(t)) { voteText = t; break; }
+        }
+    }
+
+    const target = document.querySelector("[data-zh-capture]");
+    return {
+        title: titleEl ? titleEl.innerText.trim() : "",
+        author: authorEl ? authorEl.innerText.trim() : "",
+        voteText: voteText,
+        contentHtml: target ? target.innerHTML : "",
+    };
+}"""
 
 
 class ZhihuRenderer:
@@ -80,11 +471,15 @@ class ZhihuRenderer:
     def _ensure_output_dir(cls):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # 浏览器上下文
+    # ------------------------------------------------------------------
+
     @staticmethod
     async def _build_context(browser: Browser, cookie_str: str = ""):
         """构建带 Cookie 与反检测的浏览器上下文"""
         context = await browser.new_context(
-            viewport={"width": 860, "height": 1200},
+            viewport={"width": 1000, "height": 1200},
             device_scale_factor=2,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
@@ -106,46 +501,12 @@ class ZhihuRenderer:
                     logger.warning(f"[ZhihuRenderer] 注入 Cookie 失败: {e}")
         return context
 
-    @staticmethod
-    async def _clean_page(page) -> None:
-        """净化知乎页面：关闭登录弹窗、移除广告与无关模块（带重试以应对客户端跳转）"""
-        for attempt in range(3):
-            try:
-                await page.evaluate("""() => {
-                    document.querySelectorAll(".Modal-wrapper, .sign_modal, div.Modal").forEach(el => el.remove());
-                    const junkSelectors = [
-                        "header.AppHeader", ".Sticky", ".Question-sideColumn",
-                        ".Reward", ".ContentItem-actions", ".Comments-container",
-                        ".CornerButtons", ".Ad-placeholder", ".OpenInAppButton",
-                        ".MobileAppHeader", ".ViewAll-Question", ".Recommendations-Main",
-                        ".QuestionHeader-footer", ".Post-SideActions", ".ColumnPageHeader"
-                    ];
-                    junkSelectors.forEach(sel => {
-                        document.querySelectorAll(sel).forEach(el => el.remove());
-                    });
-                    document.querySelectorAll("button.ContentItem-more").forEach(btn => btn.click());
-                    if (document.body) {
-                        document.body.style.backgroundColor = "#f6f8fa";
-                    }
-                }""")
-                return
-            except Exception as e:
-                # 页面可能正在客户端跳转（如 zhi.hu 短链重定向），等待后重试
-                if attempt < 2:
-                    await asyncio.sleep(1.5)
-                else:
-                    logger.warning(f"[ZhihuRenderer] 页面净化失败(已重试): {e}")
+    # ------------------------------------------------------------------
+    # 健壮的页面 JS 执行
+    # ------------------------------------------------------------------
 
     @staticmethod
-    async def _wait_settled(page, timeout_ms: int = 8000) -> None:
-        """等待页面网络与 DOM 稳定，避免客户端跳转导致执行上下文被销毁"""
-        try:
-            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
-        except Exception:
-            pass
-
-    @staticmethod
-    async def _safe_evaluate(page, script: str, default: Any = None, retries: int = 3) -> Any:
+    async def _safe_evaluate(page, script: str, default: Any = None, retries: int = 3, arg: Any = None) -> Any:
         """
         健壮地执行页面 JS。
         知乎为 SPA，客户端路由跳转常在 domcontentloaded 之后发生，
@@ -154,11 +515,13 @@ class ZhihuRenderer:
         last_err = None
         for attempt in range(retries):
             try:
-                return await page.evaluate(script)
+                return await (page.evaluate(script, arg) if arg is not None else page.evaluate(script))
             except Exception as e:
                 last_err = e
                 msg = str(e)
-                if "Execution context was destroyed" in msg or "navigating" in msg:
+                if ("Execution context was destroyed" in msg
+                        or "navigating" in msg
+                        or "Target crashed" in msg):
                     await asyncio.sleep(1.5)
                     try:
                         await page.wait_for_load_state("domcontentloaded", timeout=5000)
@@ -171,150 +534,296 @@ class ZhihuRenderer:
         return default
 
     @staticmethod
-    async def _mark_capture_target(page) -> None:
-        """
-        在页面中标记"内容最丰富的正文容器"（打上 data-zh-capture 属性）。
-        采用标记属性而非 JSHandle，可安全地配合重试逻辑，避免上下文销毁导致的句柄失效。
-        """
-        await ZhihuRenderer._safe_evaluate(page, """() => {
-            document.querySelectorAll("[data-zh-capture]").forEach(el => el.removeAttribute("data-zh-capture"));
-            const candidates = document.querySelectorAll(
-                ".RichText, .RichContent-inner, .Post-RichText, .QuestionAnswer-content, .Post-content"
-            );
-            let best = null;
-            let bestLen = 0;
-            candidates.forEach((el) => {
-                const len = el.innerHTML.length;
-                if (len > bestLen) { bestLen = len; best = el; }
-            });
-            (best || document.body).setAttribute("data-zh-capture", "1");
-            return true;
-        }""", default=False)
+    async def _wait_settled(page, timeout_ms: int = 8000) -> None:
+        """等待页面网络与 DOM 稳定，避免客户端跳转导致执行上下文被销毁"""
+        try:
+            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # 页面净化
+    # ------------------------------------------------------------------
 
     @staticmethod
-    async def _get_capture_element(page):
-        """获取被标记的截图目标元素，未标记时回退到 body"""
-        return (await page.query_selector("[data-zh-capture]")) or (await page.query_selector("body"))
+    async def _clean_page(page) -> None:
+        """净化知乎页面：关闭登录弹窗、移除广告与无关模块（带重试以应对客户端跳转）"""
+        for attempt in range(3):
+            try:
+                await page.evaluate(r"""() => {
+                    document.querySelectorAll(".Modal-wrapper, .sign_modal, div.Modal").forEach(el => el.remove());
+                    const junkSelectors = [
+                        "header.AppHeader", ".AppHeader", ".Sticky", ".Question-sideColumn",
+                        ".GlobalSideBar", ".Reward", ".ContentItem-actions", ".Comments-container",
+                        ".CommentsV2", ".CornerButtons", ".Ad-placeholder", ".OpenInAppButton",
+                        ".MobileAppHeader", ".ViewAll-Question", ".Recommendations-Main",
+                        ".QuestionHeader-footer", ".Post-SideActions", ".ColumnPageHeader",
+                        ".Topstory", ".BackToTop", ".Footer", ".AppFooter", ".PcWordCard",
+                        ".Banner", ".AdblockBanner", ".KfeCollection"
+                    ];
+                    junkSelectors.forEach(sel => {
+                        document.querySelectorAll(sel).forEach(el => el.remove());
+                    });
+                    if (document.body) {
+                        document.body.style.backgroundColor = "#f6f8fa";
+                    }
+                }""")
+                return
+            except Exception as e:
+                # 页面可能正在客户端跳转（如 zhi.hu 短链重定向），等待后重试
+                if attempt < 2:
+                    await asyncio.sleep(1.5)
+                else:
+                    logger.warning(f"[ZhihuRenderer] 页面净化失败(已重试): {e}")
+
+    # ------------------------------------------------------------------
+    # 内容就绪检测（核心新增）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _question_url_from_answer(url: str) -> Tuple[str, str]:
+        """从回答直达页 URL 中解析出问题页 URL 与回答 ID，失败返回 ('', '')"""
+        m = re.search(r"zhihu\.com/question/(\d+)/answer/(\d+)", url or "")
+        if not m:
+            return "", ""
+        return f"https://www.zhihu.com/question/{m.group(1)}", m.group(2)
 
     @classmethod
-    async def extract_and_screenshot_via_browser(
-        cls,
-        url: str,
-        cookie_str: str = "",
-        max_slice_height: int = 12000,
-        need_screenshot: bool = True,
-    ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
-        """
-        通过 Playwright 浏览器渲染提取知乎正文内容，并在同一次导航会话中完成原版极清截图。
-        （这是知乎专栏文章的唯一可靠通道：其 API 无签名会 403）
+    async def _is_error_page(cls, page) -> bool:
+        """判断当前是否为知乎错误页"""
+        info = await cls._safe_evaluate(page, _JS_IS_ERROR_PAGE, default=None)
+        if not info:
+            return False
+        return bool(info.get("isError"))
 
-        返回 (content_html 提取结果, 截图路径列表)。
-        need_screenshot 为 True 时会截图；若提取后发现无插图且无公式，则自动跳过截图以加速。
+    @classmethod
+    async def _fallback_to_question_page(cls, page, url: str) -> bool:
         """
-        from .fetcher import ZhihuFetcher  # 延迟导入避免循环依赖
+        知乎偶发对「回答直达页」返回错误页，此时改从问题页定位该条回答。
+        成功锁定返回 True。
+        """
+        q_url, aid = cls._question_url_from_answer(url)
+        if not q_url:
+            logger.warning(f"[ZhihuRenderer] 命中知乎错误页，但该 URL 无法推导问题页: {url}")
+            return False
 
-        browser = await get_browser()
-        context = await cls._build_context(browser, cookie_str)
-        page = await context.new_page()
+        logger.warning(f"[ZhihuRenderer] 回答直达页被知乎拦截，改从问题页定位该回答 (answer={aid})")
+        try:
+            await page.goto(q_url, wait_until="domcontentloaded", timeout=30000)
+            await cls._wait_settled(page, timeout_ms=8000)
+            await cls._clean_page(page)
+            focused = await cls._safe_evaluate(page, _JS_FOCUS_ANSWER, arg=aid,
+                                               default={"ok": False})
+            logger.info(f"[ZhihuRenderer] 问题页定位回答结果: {focused}")
+            return bool((focused or {}).get("ok"))
+        except Exception as e:
+            logger.warning(f"[ZhihuRenderer] 问题页兜底失败: {e}")
+            return False
+
+    @classmethod
+    async def _ensure_not_error_page(cls, page, url: str) -> bool:
+        """确保当前页面不是知乎错误页：先重试一次原链接，仍失败则走问题页兜底"""
+        if not await cls._is_error_page(page):
+            return True
+        logger.warning(f"[ZhihuRenderer] 检测到知乎错误页，重试一次原链接: {url}")
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await cls._wait_settled(page, timeout_ms=8000)
+            await cls._clean_page(page)
+        except Exception as e:
+            logger.warning(f"[ZhihuRenderer] 重试导航失败: {e}")
+        if not await cls._is_error_page(page):
+            return True
+        return await cls._fallback_to_question_page(page, url)
+
+    @classmethod
+    async def _prepare_page(cls, page, url: str) -> None:
+        """
+        导航并完成基础准备：净化页面、展开折叠正文、唤醒懒加载图片。
+        若命中知乎错误页（回答直达页常见），则改从问题页定位该条回答。
+        """
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.wait_for_load_state("load", timeout=8000)
+        except Exception:
+            pass
+        await cls._wait_settled(page, timeout_ms=6000)
+        await cls._clean_page(page)
+        await cls._ensure_not_error_page(page, url)
+
+        expanded = await cls._safe_evaluate(page, _JS_EXPAND_CONTENT, default=0)
+        woken = await cls._safe_evaluate(page, _JS_WAKE_IMAGES, default=0)
+        logger.info(f"[ZhihuRenderer] 页面准备完成: 展开按钮={expanded}, 唤醒图片={woken}")
+
+    @classmethod
+    async def _wait_dom_stable(cls, page, timeout_s: float = 6.0, interval: float = 0.5,
+                               need_stable: int = 2) -> bool:
+        """等待目标容器 DOM 长度连续多次不变，判定渲染已收敛"""
+        deadline = time.monotonic() + timeout_s
+        last = -1
+        stable = 0
+        while time.monotonic() < deadline:
+            cur = await cls._safe_evaluate(page, _JS_DOM_FINGERPRINT, default=-1)
+            if cur == last and cur >= 0:
+                stable += 1
+                if stable >= need_stable:
+                    return True
+            else:
+                stable = 0
+                last = cur
+            await asyncio.sleep(interval)
+        logger.warning(f"[ZhihuRenderer] DOM 稳定等待超时({timeout_s}s)，按当前状态继续")
+        return False
+
+    @classmethod
+    async def _wait_assets_ready(cls, page, timeout_s: float = 25.0, do_scroll: bool = True) -> Dict[str, Any]:
+        """
+        等待正文资源真正就绪：
+        1. 渐进滚动唤醒全部懒加载内容
+        2. 等待图片解码完成 (complete && naturalWidth > 0)
+        3. 等待公式排版完成 (MathJax / KaTeX 产物出现，且 MathJax 队列排空)
+        4. 等待 DOM 收敛
+        """
+        if do_scroll:
+            await cls._safe_evaluate(page, _JS_SCROLL_THROUGH, default=None, retries=2)
 
         try:
-            logger.info(f"[ZhihuRenderer] 浏览器渲染提取知乎内容: {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await cls._wait_settled(page)
-            await cls._clean_page(page)
-            await page.wait_for_timeout(2500)
+            await cls._safe_evaluate(page, _JS_FONTS_READY, default=True, retries=1)
+        except Exception:
+            pass
 
-            info = await cls._safe_evaluate(page, """() => {
-                const pick = (sels) => {
-                    for (const s of sels) {
-                        const el = document.querySelector(s);
-                        if (el && el.innerText.trim()) return el;
-                    }
-                    return null;
-                };
-                const titleEl = pick([".QuestionHeader-title", ".Post-Title", "h1"]);
-                const authorEl = pick([".AuthorInfo-name", ".Post-Author .AuthorInfo-name", ".AuthorInfo"]);
+        deadline = time.monotonic() + timeout_s
+        stable = 0
+        last_len = -1
+        stat: Dict[str, Any] = {}
 
-                // 赞同数：多层次兜底查找（回答页 / 专栏文章页 DOM 结构不同，且为客户端渲染）
-                let voteText = "";
-                const voteCandidates = document.querySelectorAll(
-                    ".VoteButton, .VoteButton--up, button[class*=VoteButton], .Post-Actions .Button"
-                );
-                for (const el of voteCandidates) {
-                    const t = (el.innerText || "").replace(/\\s+/g, " ").trim();
-                    if (t && /赞同|推荐/.test(t)) { voteText = t; break; }
-                }
-                if (!voteText) {
-                    const allEls = document.querySelectorAll("button, .Button, span, div");
-                    for (const el of allEls) {
-                        const t = (el.innerText || "").replace(/\\s+/g, " ").trim();
-                        if (/^赞同\\s*[\\d.]+\\s*万?$/.test(t)) {
-                            voteText = t;
-                            break;
-                        }
-                    }
-                }
+        while time.monotonic() < deadline:
+            stat = await cls._safe_evaluate(page, _JS_ASSET_STAT, default=None) or {}
+            if not stat:
+                await asyncio.sleep(0.5)
+                continue
 
-                // 选取内容最丰富的正文容器
-                const candidates = document.querySelectorAll(
-                    ".RichText, .RichContent-inner, .Post-RichText, .QuestionAnswer-content, .Post-content"
-                );
-                let best = null;
-                let bestLen = 0;
-                candidates.forEach((el) => {
-                    const len = el.innerHTML.length;
-                    if (len > bestLen) { bestLen = len; best = el; }
-                });
+            pending = (int(stat.get("pendingImg", 0))
+                       + int(stat.get("pendingMath", 0))
+                       + int(stat.get("mjPending", 0)))
 
-                return {
-                    title: titleEl ? titleEl.innerText.trim() : "",
-                    author: authorEl ? authorEl.innerText.trim() : "知乎用户",
-                    voteText: voteText,
-                    contentHtml: best ? best.innerHTML : "",
-                };
-            }""", default={})
+            if pending == 0:
+                if stat.get("htmlLen") == last_len:
+                    stable += 1
+                    if stable >= 2:
+                        logger.info(
+                            f"[ZhihuRenderer] 资源就绪: 图片 {stat.get('imgTotal', 0)} 张全部解码, "
+                            f"公式 {stat.get('mathTotal', 0)} 个全部排版完成"
+                        )
+                        return stat
+                else:
+                    stable = 0
+                    last_len = stat.get("htmlLen")
+            else:
+                stable = 0
+                last_len = stat.get("htmlLen")
 
-            content_html = (info or {}).get("contentHtml", "")
-            if not content_html:
-                return None, []
+            await asyncio.sleep(0.6)
 
-            content_data = ZhihuFetcher.build_from_browser_html(
-                content_html=content_html,
-                title=info.get("title", ""),
-                author=info.get("author", ""),
-                vote_text=info.get("voteText", ""),
-                source_url=url,
+        logger.warning(
+            f"[ZhihuRenderer] 资源等待超时({timeout_s}s)，仍待处理: "
+            f"图片 {stat.get('pendingImg', '?')}/{stat.get('imgTotal', '?')}, "
+            f"公式 {stat.get('pendingMath', '?')}/{stat.get('mathTotal', '?')}, "
+            f"MathJax 队列 {stat.get('mjPending', '?')}"
+        )
+        return stat or {}
+
+    # ------------------------------------------------------------------
+    # 纯净舞台截图
+    # ------------------------------------------------------------------
+
+    @classmethod
+    async def _capture_clean_stage(
+        cls,
+        page,
+        url: str = "",
+        width: int = 760,
+        padding: int = 26,
+        wait_timeout: float = 25.0,
+        max_slice_height: int = 12000,
+    ) -> List[str]:
+        """
+        在页面上构建隔离的干净舞台并截图。
+        先充分等待资源就绪，再裁剪，确保公式与插图均已完整渲染。
+        """
+        # 1) 滚动唤醒 + 等待图片解码与公式排版完成
+        await cls._wait_assets_ready(page, timeout_s=wait_timeout, do_scroll=True)
+
+        # 1.5) 错误页可能在滚动/懒加载过程中才出现，此处再确认一次
+        if url and not await cls._ensure_not_error_page(page, url):
+            logger.error("[ZhihuRenderer] 页面确认为知乎错误页且兜底失败，放弃截图")
+            return []
+
+        # 2) 精确定位正文容器
+        mark = await cls._safe_evaluate(page, _JS_MARK_TARGET, arg=_CAPTURE_SELECTORS,
+                                        default={"ok": False})
+        logger.info(f"[ZhihuRenderer] 正文容器命中: {mark}")
+        if not (mark or {}).get("ok"):
+            logger.error("[ZhihuRenderer] 未找到任何正文容器，放弃截图")
+            return []
+        if int((mark or {}).get("textLen", 0)) < 30:
+            logger.error(
+                f"[ZhihuRenderer] 正文容器内容过少(textLen={mark.get('textLen')})，"
+                f"疑似页面被拦截或内容未渲染，放弃截图以避免产出空白长图"
             )
+            return []
 
-            # 无插图无公式且启用极速模式时，跳过截图（页面已经在手，无需二次导航）
-            has_media = (content_data["formula_count"] > 0 or content_data["image_count"] > 0)
-            if not need_screenshot or not has_media:
-                logger.info(
-                    f"[ZhihuRenderer] 跳过截图 (need_screenshot={need_screenshot}, "
-                    f"公式={content_data['formula_count']}, 插图={content_data['image_count']})"
-                )
-                return content_data, []
+        # 3) 克隆进干净舞台，屏蔽一切非正文
+        #    舞台宽度不得超过视口宽度，否则会被挤出可视区；
+        #    视口宽度保持桌面尺寸不变，避免触发知乎的窄屏移动端样式导致排版变形
+        vp = page.viewport_size or {"width": 1000, "height": 1200}
+        vp_w = int(vp.get("width", 1000))
+        stage_width = max(600, min(int(width), vp_w))
 
-            # 在同一会话中直接截图
-            await cls._mark_capture_target(page)
-            element = await cls._get_capture_element(page)
+        built = await cls._safe_evaluate(
+            page, _JS_BUILD_STAGE,
+            arg={"width": stage_width, "padding": padding},
+            default={"ok": False},
+        )
+        if not (built or {}).get("ok"):
+            logger.warning(f"[ZhihuRenderer] 舞台构建失败: {built}")
 
-            box = await element.bounding_box()
-            target_h = int(box["height"]) if box else 2000
-            await page.set_viewport_size({"width": 860, "height": target_h + 100})
+        stage = (await page.query_selector("#zh-capture-stage")
+                 or await page.query_selector("[data-zh-capture]")
+                 or await page.query_selector("body"))
 
-            uid = uuid.uuid4().hex[:8]
-            full_img_path = os.path.join(OUTPUT_DIR, f"zh_direct_{uid}_full.png")
-            await element.screenshot(path=full_img_path, type="png")
+        # 4) 抬高视口：此前处于视口外的懒加载图片此刻才开始请求，需补等一轮
+        box = await stage.bounding_box()
+        target_h = int(box["height"]) if box else 0
+        if target_h < 120:
+            logger.error(f"[ZhihuRenderer] 舞台高度仅 {target_h}px，内容为空白，放弃截图")
+            return []
+        await page.set_viewport_size({"width": vp_w, "height": cls._clamp_height(target_h + 80)})
+        await page.wait_for_timeout(400)
+        await cls._wait_assets_ready(page, timeout_s=min(wait_timeout, 12.0), do_scroll=False)
+        await cls._wait_dom_stable(page, timeout_s=5.0)
 
-            return content_data, cls._slice_image(full_img_path, uid, max_slice_height)
+        # 5) 二次测高（等待期间布局可能增高）后正式截图
+        box = await stage.bounding_box()
+        target_h = int(box["height"]) if box else target_h
+        if target_h + 80 > _MAX_CAPTURE_PX:
+            logger.warning(
+                f"[ZhihuRenderer] 正文高度 {target_h}px 接近 Chromium 截图上限，"
+                f"将按 {_MAX_CAPTURE_PX}px 截断（可增大 max_slice_height 切片阈值缓解）"
+            )
+        await page.set_viewport_size({"width": vp_w, "height": cls._clamp_height(target_h + 80)})
+        await page.wait_for_timeout(250)
 
-        except Exception as e:
-            logger.error(f"[ZhihuRenderer] 浏览器提取知乎内容失败: {e}", exc_info=True)
-            return None, []
-        finally:
-            await page.close()
-            await context.close()
+        uid = uuid.uuid4().hex[:8]
+        full_img_path = os.path.join(OUTPUT_DIR, f"zh_direct_{uid}_full.png")
+        await stage.screenshot(path=full_img_path, type="png")
+        logger.info(f"[ZhihuRenderer] 干净舞台截图完成: {full_img_path} ({target_h}px)")
+
+        return cls._slice_image(full_img_path, uid, max_slice_height)
+
+    @staticmethod
+    def _clamp_height(h: int) -> int:
+        return max(800, min(int(h), _MAX_CAPTURE_PX))
 
     @staticmethod
     def _slice_image(full_img_path: str, uid: str, max_slice_height: int) -> List[str]:
@@ -347,11 +856,97 @@ class ZhihuRenderer:
 
             return file_paths
 
+    # ------------------------------------------------------------------
+    # 对外入口
+    # ------------------------------------------------------------------
+
     @classmethod
-    async def render_direct_zhihu_page(cls, url: str, cookie_str: str = "", max_slice_height: int = 12000) -> List[str]:
+    async def extract_and_screenshot_via_browser(
+        cls,
+        url: str,
+        cookie_str: str = "",
+        max_slice_height: int = 12000,
+        need_screenshot: bool = True,
+        content_width: int = 760,
+        content_padding: int = 26,
+        wait_timeout: float = 25.0,
+    ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
         """
-        直接通过 Playwright 访问知乎原网页进行 1:1 官方原版极清截图。
-        自动注入 Cookie 绕过登录拦截，公式与插图完美原汁原味呈现。
+        通过 Playwright 浏览器渲染提取知乎正文内容，并在同一次导航会话中完成纯净舞台截图。
+        （这是知乎专栏文章的唯一可靠通道：其 API 无签名会 403）
+
+        返回 (content_data 提取结果, 截图路径列表)。
+        need_screenshot 为 True 时会截图；若提取后发现无插图且无公式，则自动跳过截图以加速。
+        """
+        from .fetcher import ZhihuFetcher  # 延迟导入避免循环依赖
+
+        cls._ensure_output_dir()
+        browser = await get_browser()
+        context = await cls._build_context(browser, cookie_str)
+        page = await context.new_page()
+
+        try:
+            logger.info(f"[ZhihuRenderer] 浏览器渲染提取知乎内容: {url}")
+            await cls._prepare_page(page, url)
+            # 文本提取只需 DOM 收敛，无需等待图片与公式，保持响应速度
+            await cls._wait_dom_stable(page, timeout_s=6.0)
+
+            await cls._safe_evaluate(page, _JS_MARK_TARGET, arg=_CAPTURE_SELECTORS,
+                                     default={"ok": False})
+            info = await cls._safe_evaluate(page, _JS_EXTRACT_INFO, default={}) or {}
+
+            content_html = info.get("contentHtml", "")
+            if not content_html:
+                logger.warning("[ZhihuRenderer] 未提取到正文 HTML")
+                return None, []
+
+            content_data = ZhihuFetcher.build_from_browser_html(
+                content_html=content_html,
+                title=info.get("title", ""),
+                author=info.get("author", ""),
+                vote_text=info.get("voteText", ""),
+                source_url=url,
+            )
+
+            # 无插图无公式且启用极速模式时，跳过截图（页面已经在手，无需二次导航）
+            has_media = (content_data["formula_count"] > 0 or content_data["image_count"] > 0)
+            if not need_screenshot or not has_media:
+                logger.info(
+                    f"[ZhihuRenderer] 跳过截图 (need_screenshot={need_screenshot}, "
+                    f"公式={content_data['formula_count']}, 插图={content_data['image_count']})"
+                )
+                return content_data, []
+
+            images = await cls._capture_clean_stage(
+                page=page,
+                url=url,
+                width=content_width,
+                padding=content_padding,
+                wait_timeout=wait_timeout,
+                max_slice_height=max_slice_height,
+            )
+            return content_data, images
+
+        except Exception as e:
+            logger.error(f"[ZhihuRenderer] 浏览器提取知乎内容失败: {e}", exc_info=True)
+            return None, []
+        finally:
+            await page.close()
+            await context.close()
+
+    @classmethod
+    async def render_direct_zhihu_page(
+        cls,
+        url: str,
+        cookie_str: str = "",
+        max_slice_height: int = 12000,
+        content_width: int = 760,
+        content_padding: int = 26,
+        wait_timeout: float = 25.0,
+    ) -> List[str]:
+        """
+        直接通过 Playwright 访问知乎原网页进行纯净舞台极清截图。
+        自动注入 Cookie 绕过登录拦截，等待公式与插图完整渲染后再截图。
         """
         cls._ensure_output_dir()
         browser = await get_browser()
@@ -360,29 +955,25 @@ class ZhihuRenderer:
 
         try:
             logger.info(f"[ZhihuRenderer] 导航知乎原网页截图: {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await cls._wait_settled(page)
-            await cls._clean_page(page)
-            await page.wait_for_timeout(2500)
-
-            # 定位正文主体（优先选取内容最丰富的容器）
-            await cls._mark_capture_target(page)
-            element = await cls._get_capture_element(page)
-
-            box = await element.bounding_box()
-            target_h = int(box["height"]) if box else 2000
-
-            await page.set_viewport_size({"width": 860, "height": target_h + 100})
-
-            uid = uuid.uuid4().hex[:8]
-            full_img_path = os.path.join(OUTPUT_DIR, f"zh_direct_{uid}_full.png")
-            await element.screenshot(path=full_img_path, type="png")
-
-            return cls._slice_image(full_img_path, uid, max_slice_height)
-
+            await cls._prepare_page(page, url)
+            return await cls._capture_clean_stage(
+                page=page,
+                url=url,
+                width=content_width,
+                padding=content_padding,
+                wait_timeout=wait_timeout,
+                max_slice_height=max_slice_height,
+            )
+        except Exception as e:
+            logger.error(f"[ZhihuRenderer] 知乎原网页截图失败: {e}", exc_info=True)
+            return []
         finally:
             await page.close()
             await context.close()
+
+    # ------------------------------------------------------------------
+    # AI 总结卡片
+    # ------------------------------------------------------------------
 
     @classmethod
     async def render_markdown_summary_card(
@@ -412,7 +1003,7 @@ class ZhihuRenderer:
 
         badge_info = f'<span class="badge">包含 {formula_count} 个数学公式</span>' if formula_count > 0 else '<span class="badge">深度精读</span>'
         # 赞同数可能因页面异步渲染而缺失，仅在获取到时展示，避免显示误导性的 0
-        vote_info = f" · {voteup} 赞同" if voteup and voteup > 0 else "" 
+        vote_info = f" · {voteup} 赞同" if voteup and voteup > 0 else ""
 
         if os.path.exists(LOCAL_MATHJAX_PATH):
             mathjax_script_tag = f'<script type="text/javascript" src="file://{LOCAL_MATHJAX_PATH}?config=TeX-MML-AM_CHTML"></script>'
@@ -561,6 +1152,12 @@ class ZhihuRenderer:
                     await page.evaluate("""() => new Promise((resolve) => {
                         MathJax.Hub.Queue(["Typeset", MathJax.Hub], () => resolve(true));
                     })""")
+                    # 确认排版队列彻底排空后再截图，避免公式半渲染
+                    await page.wait_for_function(
+                        "() => !(window.MathJax && window.MathJax.Hub && window.MathJax.Hub.queue "
+                        "&& window.MathJax.Hub.queue.pending > 0)",
+                        timeout=6000,
+                    )
                 except Exception as e:
                     logger.warning(f"[ZhihuRenderer] MathJax Typeset wait timed out: {e}")
 

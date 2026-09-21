@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
     name="astrbot_plugin_zhihu_article",
     author="VesperaZephyr",
     desc="自动读取知乎回答与专栏文章全部内容，保留数学公式，合并转发知乎原版高清长图与 Markdown 深度总结导读",
-    version="1.0.0",
+    version="1.1.0",
     repo="https://github.com/VesperaZephyr/astrbot_plugin_zhihu_article"
 )
 class ZhihuArticlePlugin(Star):
@@ -40,7 +40,7 @@ class ZhihuArticlePlugin(Star):
         super().__init__(context)
         self.config = config
         self._handling_ids = set()
-        logger.info("[ZhihuArticlePlugin] 知乎回答与专栏文章全文精读与公式总结插件 v1.0.0 已加载。")
+        logger.info("[ZhihuArticlePlugin] 知乎回答与专栏文章全文精读与公式总结插件 v1.1.0 已加载。")
 
     def _get_cookie(self) -> str:
         """获取知乎 Cookie（若未配置，尝试从其他知乎插件自动继承）"""
@@ -172,6 +172,9 @@ class ZhihuArticlePlugin(Star):
             cookie_str = self._get_cookie()
             fast_text_mode = self.config.get("fast_text_when_no_formula", True)
             max_slice_h = int(self.config.get("max_slice_height", 12000))
+            content_width = int(self.config.get("content_width", 760))
+            content_padding = int(self.config.get("content_padding", 26))
+            wait_timeout = float(self.config.get("content_wait_timeout", 25))
 
             # 1. 优先使用知乎 API 快速抓取（回答 / 问题通道，无需浏览器）
             content_data = await ZhihuFetcher.fetch(content_type, target_id, cookie_str)
@@ -186,6 +189,9 @@ class ZhihuArticlePlugin(Star):
                     cookie_str=cookie_str,
                     max_slice_height=max_slice_h,
                     need_screenshot=True,
+                    content_width=content_width,
+                    content_padding=content_padding,
+                    wait_timeout=wait_timeout,
                 )
 
             if not content_data:
@@ -277,14 +283,31 @@ class ZhihuArticlePlugin(Star):
                     article_img_paths = await ZhihuRenderer.render_direct_zhihu_page(
                         url=source_url,
                         cookie_str=cookie_str,
-                        max_slice_height=max_slice_h
+                        max_slice_height=max_slice_h,
+                        content_width=content_width,
+                        content_padding=content_padding,
+                        wait_timeout=wait_timeout,
                     )
                 total_parts = len(article_img_paths)
+                added_img = 0
                 for idx, p in enumerate(article_img_paths, 1):
                     if os.path.exists(p):
                         part_label = f"知乎原版解析 ({idx}/{total_parts})" if total_parts > 1 else "知乎原版解析"
                         forward_nodes.append(
                             Node(content=[Image.fromFileSystem(p)], name=part_label, uin=bot_uin)
+                        )
+                        added_img += 1
+
+                # 安全网：长图截图未产出任何图片时（如知乎对回答直达页返回错误页），
+                # 回退为纯文本分段，确保用户仍能拿到完整正文而不是只剩一段总结
+                if added_img == 0 and full_text:
+                    logger.warning("[ZhihuArticlePlugin] 长图截图未产出图片，回退为纯文本分段转发")
+                    chunks = self._split_text_to_chunks(full_text, max_chars=1800)
+                    total_chunks = len(chunks)
+                    for idx, chunk in enumerate(chunks, 1):
+                        node_label = f"知乎原文 ({idx}/{total_chunks})" if total_chunks > 1 else "知乎原文"
+                        forward_nodes.append(
+                            Node(content=[Plain(chunk)], name=node_label, uin=bot_uin)
                         )
 
             # 发送合并转发

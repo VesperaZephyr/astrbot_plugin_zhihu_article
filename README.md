@@ -3,7 +3,7 @@
 <div align="center">
 
 ![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-blue.svg)
-![Version](https://img.shields.io/badge/Version-1.0.0-green.svg)
+![Version](https://img.shields.io/badge/Version-1.1.0-green.svg)
 ![License](https://img.shields.io/badge/License-MIT-orange.svg)
 ![Author](https://img.shields.io/badge/Author-VesperaZephyr-purple.svg)
 
@@ -34,11 +34,13 @@
   - 自动深入知乎 DOM，从 `<span class="ztext-math" data-tex="...">` 精准提取原始 LaTeX 代码；
   - 全面支持包括 `\[ ... \]`、`\( ... \)`、`$$ ... $$`、`$ ... $` 在内的全部 LaTeX 语法；
   - 采用服务器本地离线 **MathJax 2.7.7** 引擎排版，彻底根治公式乱码，呈现标准教材级矢量数学排版！
-- 📸 **知乎官方原网页 1:1 极清截图，插图 100% 真实呈现**：
+- 📸 **知乎官方原网页极清截图，插图 100% 真实呈现**：
   - 只要回答/文章包含插图或数学公式，直接通过 Playwright Chromium 导航知乎原版网页截图；
   - **插图 100% 真实原版高清呈现，绝无 `[配图: 插图]` 占位符！**
   - **公式零浮动、零位移、零变形！** 官方怎么排版，长图就怎么呈现；
-  - 自动净化页面：剔除知乎顶部导航、浮动登录弹窗、侧边栏推荐、底部开会广告与评论区等冗余杂项。
+  - 🆕 **内容就绪检测**：渐进滚动唤醒全部懒加载图片 → 强制注入真实图片地址 → 轮询等待**全部图片解码完成**与**全部公式（MathJax / KaTeX）排版完成**（含 MathJax 队列排空）→ DOM 收敛后才截图，**彻底根治「公式还没渲染完就截图」**；
+  - 🆕 **纯净舞台裁剪**：按优先级精确锁定正文容器，克隆进隔离的白底舞台中渲染，顶栏、侧栏、推荐流、广告、评论区、页脚**全部不进画面**；舞台边距紧凑可调，**根治「截图边角太多、非正文占比过高」**；
+  - 🆕 **错误页兜底**：知乎偶发对「回答直达页」返回错误页时，自动重试并改从问题页定位该条回答；彻底失败时降级为纯文本分段，绝不产出空白长图。
 - 🎯 **AI 导读自适应定制，拒绝生搬硬套**：
   - **无数学公式内容**：采用社科/通用问答 Prompt，**严禁生硬出现数学词汇**，语言通俗自然；
   - **包含数学公式内容**：开启专业数理逻辑与公式推导分析。
@@ -116,8 +118,39 @@ python -m playwright install-deps chromium
 | `fast_text_when_no_formula` | `true` | 是否在文章无图无公式时启用极速纯文本模式 |
 | `summary_style` | `academic_math` | AI 总结风格：`academic_math`(学术与数理精读) / `concise`(极简速读) / `detailed`(详细全面) |
 | `max_slice_height` | `12000` | 单张长图最大高度阈值（像素），超过自动进行智能无缝分段切片 |
+| `content_wait_timeout` | `25` | 正文资源等待上限（秒）。等待图片解码与公式排版完成的最长时间，长文或公式极多时可调大 |
+| `content_width` | `760` | 长图正文宽度（像素），即最终长图的视觉宽度 |
+| `content_padding` | `26` | 长图正文四周留白（像素），越小则正文占比越高 |
 | `access_mode` | `blacklist` | 群聊权限控制模式：`blacklist`(黑名单) / `whitelist`(白名单) |
 | `group_list` | `""` | 黑名单或白名单的群号列表（逗号分隔） |
+
+---
+
+## 📝 更新日志
+
+### v1.1.0
+
+**修复**
+
+1. **公式/插图未加载完就截图** —— 原实现仅等待固定的 2.5 秒，知乎的 MathJax/KaTeX 异步排版与图片懒加载经常尚未完成。
+   现改为「就绪检测」：渐进式滚动唤醒懒加载 → 把 `data-original` / `data-actualsrc` 等真实地址写回 `src` → 轮询等待所有图片
+   `complete && naturalWidth > 0`、所有 `.ztext-math` 出现 MathJax/KaTeX 排版产物且 `MathJax.Hub.queue.pending` 归零
+   → 正文 DOM 指纹连续两次不变，才执行截图（全程带超时降级，不会卡死）。
+2. **截图混入大量非正文（页面边角过多）** —— 原实现用「innerHTML 最长」的启发式挑选容器，容易命中带作者卡、赞同按钮、
+   版权声明的外层容器；兜底 `document.body` 更是把顶栏、侧栏、推荐流、广告、评论区、页脚一并截入。现改为按优先级选择器
+   精确定位正文（`.Post-RichText` > `.QuestionAnswer-content .RichText` > …），克隆进隔离的白底舞台 `#zh-capture-stage`，
+   隐藏页面其余全部内容，并去除克隆体内残留的非正文模块。
+3. **回答直达页产出空白长图** —— 知乎对 `/question/{id}/answer/{id}` 有时会向无头浏览器返回「出了一点问题」错误页。
+   现加入错误页检测，先重试原链接，仍失败则改从问题页定位该条回答；全部失败时不产出空白图，并在群内降级为纯文本分段。
+4. **折叠长文被截断** —— 新增点击「阅读全文」并解除 `max-height` 截断与渐变遮罩。
+
+**其他**
+
+- 新增 `content_wait_timeout` / `content_width` / `content_padding` 三项配置。
+- 视口宽度保持桌面尺寸不变，仅调整高度，避免窄视口触发知乎移动端媒体查询导致排版变形。
+- 公式子树跳过 `max-width` 归一化，防止长公式被挤压换行错乱。
+- 隐藏滚动条，避免占位宽度把截图舞台挤出可视区。
+- AI 总结卡片渲染同样等待 MathJax 队列排空后再截图。
 
 ---
 
