@@ -2,13 +2,28 @@
 """
 Playwright 知乎原版极清截图与 MathJax 总结卡片渲染引擎
 
+v1.1.3 关键修复：
+  知乎**问题页**的公式是「进入视野才排版」的：目标回答不在视野内时，等再久也不会
+  产生排版产物（实测 31/31 全部停留在裸 data-tex）；而问题页滚到底又会触发 SPA
+  加载更多回答，无头会话随即被反爬踢成「出了一点问题」错误页 —— 且目标回答常位于
+  文档末尾，「滚进视野」等价于「滚到底」，滚动这条路根本走不通。
+  现改为：问题页一律不做全页滚动，直接令 MathJax 对目标容器执行一次排版
+  （MathJax.Hub.Queue(["Typeset", Hub, el])），并带最多 3 次补推。
+  实测：同一回答 31 个公式由 0/31 变为 31/31，页面全程存活。
+
+v1.1.2 关键修复：
+  知乎对「回答直达页」返回错误页时，兜底会导航到问题页定位该条回答；但导航后
+  没有重跑「带滚动的资源就绪等待」。由于干净舞台是**克隆** DOM，未排版的公式克隆
+  进去后 MathJax 不再处理，只在舞台里等待永远等不到 —— 最终截到的是原始 LaTeX 源码。
+  现由 _ensure_not_error_page 回传「是否发生过导航」，导航后、克隆前重跑一次就绪等待。
+
 v1.1.1 关键修复：
   公式就绪判定不再把 MathJax_Preview 当作「已排版」标志（它是排版前的占位元素），
   改为要求真实排版产物存在且具备实际尺寸，杜绝「公式未渲染就截图」。
 
 核心能力：
-1. 【内容就绪检测】渐进滚动唤醒懒加载 -> 强制注入真实图片地址 -> 轮询等待全部图片
-   解码完成 & 全部公式（MathJax / KaTeX）排版完成 -> 等待 DOM 稳定。
+1. 【内容就绪检测】唤醒懒加载 -> 强制注入真实图片地址 -> 主动触发公式排版 ->
+   轮询等待全部图片解码完成 & 全部公式（MathJax / KaTeX）排版完成 -> 等待 DOM 稳定。
    彻底根治「公式还没渲染完就截图」「长图下半部分图片空白」。
 2. 【纯净舞台裁剪】按优先级精确锁定正文容器，克隆进隔离的干净舞台中渲染，
    屏蔽顶栏 / 侧栏 / 广告 / 评论区 / 页脚等一切非正文内容，并压缩无意义留白。
@@ -195,6 +210,51 @@ _JS_SCROLL_THROUGH = r"""async () => {
     window.scrollTo(0, 0);
     await sleep(150);
     return finalH;
+}"""
+
+# 主动请求页面上的 MathJax 对目标正文容器执行一次排版。
+#
+# 为什么需要它：知乎问题页的公式是「进入视野才排版」的。经实测，目标回答不在
+# 视野内时，无论等多久都不会产生排版产物（31/31 公式全部停留在裸 data-tex）。
+# 而把问题页滚到底又会触发 SPA 加载更多回答，无头会话随即被反爬踢成
+# 「出了一点问题」错误页，整页内容丢失 —— 且目标回答常位于文档末尾，任何
+# 「滚进视野」的操作都等价于滚到底。因此这里完全不滚动，直接令 MathJax 排版。
+_JS_FORCE_TYPESET = r"""async () => {
+    const el = document.getElementById("zh-capture-stage")
+        || document.querySelector("[data-zh-capture]")
+        || document.body;
+    if (!el) return { ok: false, reason: "no-target" };
+    const M = window.MathJax;
+    if (!M) return { ok: false, reason: "no-mathjax" };
+    try {
+        if (M.Hub && typeof M.Hub.Queue === "function") {
+            M.Hub.Queue(["Typeset", M.Hub, el]);
+            return { ok: true, engine: "mathjax2-hub" };
+        }
+        if (typeof M.typesetPromise === "function") {
+            await M.typesetPromise([el]);
+            return { ok: true, engine: "mathjax3-typesetPromise" };
+        }
+        if (typeof M.typeset === "function") {
+            const p = M.typeset(el);
+            if (p && typeof p.then === "function") { try { await p; } catch (e) {} }
+            return { ok: true, engine: "mathjax3-typeset" };
+        }
+    } catch (e) {
+        return { ok: false, reason: String(e) };
+    }
+    return { ok: false, reason: "no-typeset-entry" };
+}"""
+
+# 判定当前页面类型：问题页本身（/question/<id>）还是回答直达页（.../answer/<aid>）
+# 问题页禁止全页滚动（滚到底触发反爬），回答页与专栏页则依赖滚动唤醒懒加载。
+_JS_PAGE_KIND = r"""() => {
+    const p = location.pathname || "";
+    const m = p.match(/^\/question\/(\d+)\/?$/);
+    return { path: p,
+             isQuestionPage: !!m,
+             qid: m ? m[1] : null,
+             isAnswerPage: /\/answer\/\d+/.test(p) };
 }"""
 
 # 统计待完成资源：未解码图片 / 未排版公式 / MathJax 队列积压 / DOM 长度指纹
@@ -635,20 +695,31 @@ class ZhihuRenderer:
             return False
 
     @classmethod
-    async def _ensure_not_error_page(cls, page, url: str) -> bool:
-        """确保当前页面不是知乎错误页：先重试一次原链接，仍失败则走问题页兜底"""
+    async def _ensure_not_error_page(cls, page, url: str) -> Tuple[bool, bool]:
+        """
+        确保当前页面不是知乎错误页：先重试一次原链接，仍失败则走问题页兜底。
+
+        返回 (是否可用, 是否发生过导航)。
+
+        「是否发生过导航」必须回传给调用方：一旦发生导航，整页内容被重置，
+        此前唤醒过的懒加载图片与公式全部作废；而后续的干净舞台是**克隆** DOM，
+        克隆进去的未排版公式 MathJax 不会再处理，只靠在舞台里等待永远等不到。
+        因此调用方必须在导航后、克隆**之前**重跑一次带滚动的资源就绪等待。
+        """
         if not await cls._is_error_page(page):
-            return True
+            return True, False
         logger.warning(f"[ZhihuRenderer] 检测到知乎错误页，重试一次原链接: {url}")
+        navigated = False
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await cls._wait_settled(page, timeout_ms=8000)
             await cls._clean_page(page)
+            navigated = True
         except Exception as e:
             logger.warning(f"[ZhihuRenderer] 重试导航失败: {e}")
         if not await cls._is_error_page(page):
-            return True
-        return await cls._fallback_to_question_page(page, url)
+            return True, navigated
+        return await cls._fallback_to_question_page(page, url), True
 
     @classmethod
     async def _prepare_page(cls, page, url: str) -> None:
@@ -693,22 +764,43 @@ class ZhihuRenderer:
     async def _wait_assets_ready(cls, page, timeout_s: float = 25.0, do_scroll: bool = True) -> Dict[str, Any]:
         """
         等待正文资源真正就绪：
-        1. 渐进滚动唤醒全部懒加载内容
+        1. 唤醒懒加载内容（问题页改为主动触发 MathJax 排版，见下）
         2. 等待图片解码完成 (complete && naturalWidth > 0)
         3. 等待公式排版完成 (MathJax / KaTeX 产物出现，且 MathJax 队列排空)
         4. 等待 DOM 收敛
         """
+        kind = await cls._safe_evaluate(page, _JS_PAGE_KIND, default=None) or {}
+
         if do_scroll:
-            await cls._safe_evaluate(page, _JS_SCROLL_THROUGH, default=None, retries=2)
+            if kind.get("isQuestionPage"):
+                # 问题页禁止全页滚动：滚到底会让知乎 SPA 去加载更多回答，
+                # 无头会话随即被反爬踢成「出了一点问题」错误页，整页内容丢失。
+                logger.info(
+                    "[ZhihuRenderer] 当前为问题页，跳过全页滚动（会触发反爬），改用主动排版公式"
+                )
+            else:
+                await cls._safe_evaluate(page, _JS_SCROLL_THROUGH, default=None, retries=2)
 
         try:
             await cls._safe_evaluate(page, _JS_FONTS_READY, default=True, retries=1)
         except Exception:
             pass
 
+        # 主动触发一次目标容器的公式排版：知乎问题页的公式「进入视野才排版」，
+        # 目标回答不在视野内时纯等待永远不会完成；直接令 MathJax 排版既可绕开
+        # 「滚动触发反爬」的死结，也不再依赖懒加载时机。
+        pushes = 0
+        push = await cls._safe_evaluate(page, _JS_FORCE_TYPESET, default=None, retries=1)
+        if (push or {}).get("ok"):
+            pushes += 1
+            logger.info(f"[ZhihuRenderer] 已主动请求公式排版: {push.get('engine')}")
+        elif push:
+            logger.info(f"[ZhihuRenderer] 主动排版未执行: {push.get('reason')}")
+
         deadline = time.monotonic() + timeout_s
         stable = 0
         last_len = -1
+        next_push = time.monotonic() + 5.0
         stat: Dict[str, Any] = {}
 
         while time.monotonic() < deadline:
@@ -737,6 +829,18 @@ class ZhihuRenderer:
                 stable = 0
                 last_len = stat.get("htmlLen")
 
+                # 公式迟迟不排版时补推（最多 3 次，间隔 5s），
+                # 覆盖 MathJax 尚未加载完 / 引擎需要二次驱动的情况。
+                if pushes < 3 and time.monotonic() >= next_push:
+                    again = await cls._safe_evaluate(page, _JS_FORCE_TYPESET, default=None, retries=1)
+                    next_push = time.monotonic() + 5.0
+                    if (again or {}).get("ok"):
+                        pushes += 1
+                        logger.info(
+                            f"[ZhihuRenderer] 再次请求公式排版(第 {pushes} 次)，"
+                            f"仍待处理公式 {stat.get('pendingMath', '?')}/{stat.get('mathTotal', '?')}"
+                        )
+
             await asyncio.sleep(0.6)
 
         logger.warning(
@@ -746,6 +850,12 @@ class ZhihuRenderer:
             f"MathJax 队列 {stat.get('mjPending', '?')}"
         )
         return stat or {}
+
+    @classmethod
+    async def _is_question_page(cls, page) -> bool:
+        """当前是否停留在问题页本身（问题页滚到底会被知乎反爬踢成错误页）"""
+        info = await cls._safe_evaluate(page, _JS_PAGE_KIND, default=None)
+        return bool((info or {}).get("isQuestionPage"))
 
     # ------------------------------------------------------------------
     # 纯净舞台截图
@@ -777,9 +887,18 @@ class ZhihuRenderer:
         await cls._wait_assets_ready(page, timeout_s=wait_timeout, do_scroll=True)
 
         # 2.5) 错误页可能在滚动/懒加载过程中才出现，此处再确认一次
-        if url and not await cls._ensure_not_error_page(page, url):
-            logger.error("[ZhihuRenderer] 页面确认为知乎错误页且兜底失败，放弃截图")
-            return []
+        if url:
+            ok, navigated = await cls._ensure_not_error_page(page, url)
+            if not ok:
+                logger.error("[ZhihuRenderer] 页面确认为知乎错误页且兜底失败，放弃截图")
+                return []
+            if navigated:
+                # 兜底/重试导航把整页重置了：懒加载的插图与公式尚未被唤醒，
+                # 而舞台是克隆 DOM —— 未排版的公式克隆进去后 MathJax 不再处理，
+                # 只能截到原始 LaTeX 源码。必须在这里重跑一次资源就绪等待
+                # （问题页不会滚动，改为主动请求 MathJax 排版目标容器）。
+                logger.info("[ZhihuRenderer] 兜底导航后重跑资源就绪等待")
+                await cls._wait_assets_ready(page, timeout_s=wait_timeout, do_scroll=True)
 
         # 3) 精确定位正文容器（滚动后 DOM 可能已变化，重新确认一次）
         mark = await cls._safe_evaluate(page, _JS_MARK_TARGET, arg=_CAPTURE_SELECTORS,
